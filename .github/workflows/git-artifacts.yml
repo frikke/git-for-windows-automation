@@ -1,5 +1,5 @@
 name: git-artifacts
-run-name: Build git-artifacts (${{ inputs.architecture }})
+run-name: Build git-artifacts (${{ inputs.artifacts != '' && format('{0} ', inputs.artifacts) || '' }}${{ inputs.architecture }})
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
         type: choice
         description: 'Architecture to build'
         required: true
-        options: 
+        options:
         - x86_64
         - i686
         - aarch64
@@ -45,14 +45,14 @@ jobs:
   pkg:
     runs-on: ${{ github.event.inputs.architecture == 'aarch64' && fromJSON('["Windows", "ARM64"]') || 'windows-latest' }}
     outputs:
-      artifact_matrix: ${{steps.artifact-build-matrix.outputs.matrix}}
+      artifact_matrix: ${{ steps.artifact-build-matrix.outputs.result }}
       msystem: ${{steps.configure-environment.outputs.MSYSTEM}}
       mingw_package_prefix: ${{steps.configure-environment.outputs.MINGW_PACKAGE_PREFIX}}
       sdk_repo_arch: ${{steps.configure-environment.outputs.SDK_REPO_ARCH}}
       check-run-state: ${{steps.check-run-state.outputs.check-run-state}}
     steps:
       - name: clone git-for-windows-automation
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Construct bundle-artifacts from existing tag
         if: env.EXISTING_GIT_TAG != ''
         run: |
@@ -80,7 +80,7 @@ jobs:
           echo "GIT_REV=$(git rev-parse --verify "refs/tags/$EXISTING_GIT_TAG"^0)" >>$GITHUB_ENV
       - name: wait if workflow run has not finished yet
         if: env.TAG_GIT_WORKFLOW_RUN_ID != ''
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             const { waitForWorkflowRunToFinish } = require('./workflow-runs')
@@ -92,7 +92,7 @@ jobs:
               process.env.TAG_GIT_WORKFLOW_RUN_ID
             )
       - name: Get bundle-artifacts download URL
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         if: env.TAG_GIT_WORKFLOW_RUN_ID != ''
         id: get-bundle-artifacts-url
         with:
@@ -129,7 +129,7 @@ jobs:
           text: "For details, see [this run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id}})."
           details-url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id}}"
       - name: Re-publish bundle-artifacts so the next job can easily use it
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bundle-artifacts
           path: bundle-artifacts
@@ -167,11 +167,13 @@ jobs:
           echo "MINGW_PACKAGE_PREFIX=$MINGW_PACKAGE_PREFIX" >> $GITHUB_OUTPUT
           echo "SDK_REPO_ARCH=$SDK_REPO_ARCH" >> $GITHUB_OUTPUT
           test -n "$ARTIFACTS_TO_BUILD" || {
-            ARTIFACTS_TO_BUILD="installer portable archive mingit"
+            ARTIFACTS_TO_BUILD="mingit"
+            test "$ARCHITECTURE" = i686 || ARTIFACTS_TO_BUILD="installer portable archive $ARTIFACTS_TO_BUILD"
             test "$ARCHITECTURE" = aarch64 || ARTIFACTS_TO_BUILD="$ARTIFACTS_TO_BUILD mingit-busybox"
             test "$ARCHITECTURE" != x86_64 || ARTIFACTS_TO_BUILD="$ARTIFACTS_TO_BUILD nuget"
           }
           echo "ARTIFACTS_TO_BUILD=$ARTIFACTS_TO_BUILD" >> $GITHUB_ENV
+          echo "PKG_CACHE_KEY=pkg-$GIT_VERSION-$ARCHITECTURE-$TAG_GIT_WORKFLOW_RUN_ID" >> $GITHUB_ENV
       - name: Configure user
         run:
           USER_NAME="${{github.actor}}" &&
@@ -185,7 +187,7 @@ jobs:
           flavor: build-installers
           architecture: ${{env.architecture}}
       - name: Create artifact build matrix
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         id: artifact-build-matrix
         with:
           script: |
@@ -194,16 +196,16 @@ jobs:
             try {
               const output = createArtifactsMatrix(process.env.ARTIFACTS_TO_BUILD, process.env.ARCHITECTURE)
               core.info(`Will be using the following matrix: ${JSON.stringify(output)}`)
-              core.setOutput('matrix', output)
+              return output
             } catch (e) {
               core.setFailed(e.message)
             }
       - name: Restore ${{env.MINGW_PACKAGE_PREFIX}}-git, if cached
         id: restore-cached-git-pkg
-        uses: actions/cache/restore@v3
+        uses: actions/cache/restore@v4
         with:
           path: artifacts
-          key: pkg-${{env.GIT_VERSION}}-${{env.ARCHITECTURE}}-${{env.TAG_GIT_WORKFLOW_RUN_ID}}
+          key: ${{ env.PKG_CACHE_KEY }}
       - name: Clone and update build-extra
         if: steps.restore-cached-git-pkg.outputs.cache-hit != 'true'
         run: |
@@ -225,6 +227,7 @@ jobs:
       - name: Prepare git-for-windows/git clone with the tag
         if: steps.restore-cached-git-pkg.outputs.cache-hit != 'true'
         run: |
+          set -x
           if test ! -d /usr/src/MINGW-packages
           then
             git clone --depth 1 --single-branch -b main \
@@ -245,7 +248,8 @@ jobs:
           then
             git fetch origin "refs/tags/$EXISTING_GIT_TAG:refs/tags/$EXISTING_GIT_TAG"
           else
-            git fetch --tags "$GITHUB_WORKSPACE"/bundle-artifacts/git.bundle \
+            git -c fetch.writeCommitGraph=false fetch --tags --no-recurse-submodules \
+             "$GITHUB_WORKSPACE"/bundle-artifacts/git.bundle \
               $(cat "$GITHUB_WORKSPACE"/bundle-artifacts/next_version)
           fi &&
           git reset --hard $(cat "$GITHUB_WORKSPACE"/bundle-artifacts/next_version)
@@ -261,12 +265,14 @@ jobs:
           echo -n "$CODESIGN_PASS" >.sig/codesign.pass
           git config --global alias.signtool '!sh "/usr/src/build-extra/signtool.sh"'
       - name: Prepare home directory for GPG signing
+        timeout-minutes: 5
         if: env.GPGKEY != '' && steps.restore-cached-git-pkg.outputs.cache-hit != 'true'
         run: |
           echo '${{secrets.PRIVGPGKEY}}' | tr % '\n' | gpg $GPG_OPTIONS --import &&
           info="$(gpg --list-keys --with-colons "${GPGKEY%% *}" | cut -d : -f 1,10 | sed -n '/^uid/{s|uid:||p;q}')" &&
           git config --global user.name "${info% <*}" &&
-          git config --global user.email "<${info#*<}"
+          git config --global user.email "<${info#*<}" &&
+          echo "PACKAGER=$info" >>$GITHUB_ENV
         env:
           GPGKEY: ${{secrets.GPGKEY}}
       - name: update check-run
@@ -277,6 +283,7 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           append-text: 'About to build the `${{env.MINGW_PACKAGE_PREFIX}}-git` package'
       - name: Build ${{env.MINGW_PACKAGE_PREFIX}}-git
+        timeout-minutes: 60
         if: steps.restore-cached-git-pkg.outputs.cache-hit != 'true'
         env:
           GPGKEY: "${{secrets.GPGKEY}}"
@@ -284,10 +291,13 @@ jobs:
           set -x
           BUILD_SRC=$(test x86_64 != "$ARCHITECTURE" || echo "--build-src-pkg")
           # Make sure that there is a `/usr/bin/git` that can be used by `makepkg-mingw`
-          printf '#!/bin/sh\n\nexec '$MINGW_PREFIX'/bin/git.exe "$@"\n' >/usr/bin/git &&
+          if test ! -x /usr/bin/git
+          then
+            printf '#!/bin/sh\n\nexec '$MINGW_PREFIX'/bin/git.exe "$@"\n' >/usr/bin/git
+          fi &&
           (
             cd /usr/src/MINGW-packages/mingw-w64-git/src/git &&
-            /usr/src/build-extra/please.sh build-mingw-w64-git --only-$ARCHITECTURE $BUILD_SRC \
+            /usr/src/build-extra/please.sh build-mingw-w64-git --reset-pkgrel --only-$ARCHITECTURE $BUILD_SRC \
               -o "$GITHUB_WORKSPACE"/artifacts HEAD
           ) &&
           cp bundle-artifacts/ver artifacts/ &&
@@ -305,21 +315,22 @@ jobs:
           if test -z "$EXISTING_GIT_TAG"
           then
             git commit -s -m "mingw-w64-git: new version ($version)" PKGBUILD &&
-          git bundle create "$b"/MINGW-packages.bundle origin/main..main
+            git bundle create "$b"/MINGW-packages.bundle origin/main..main
           elif ! git update-index --ignore-submodules --refresh ||
             ! git diff-files --ignore-submodules ||
             ! git diff-index --cached --ignore-submodules HEAD
           then
             echo "::warning::Uncommitted changes after build!" >&2 &&
             git diff >&2 &&
+            git commit -s -m "mingw-w64-git: new version ($version)" PKGBUILD &&
             git bundle create "$b"/MINGW-packages.bundle main^..main
           fi)
       - name: Cache ${{env.MINGW_PACKAGE_PREFIX}}-git
         if: steps.restore-cached-git-pkg.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v3
+        uses: actions/cache/save@v4
         with:
           path: artifacts
-          key: pkg-${{env.GIT_VERSION}}-${{env.ARCHITECTURE}}-${{env.TAG_GIT_WORKFLOW_RUN_ID}}
+          key: ${{ env.PKG_CACHE_KEY }}
       - name: update check-run
         uses: ./.github/actions/check-run-action
         with:
@@ -327,7 +338,7 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           append-text: 'The `${{env.MINGW_PACKAGE_PREFIX}}-git` package was built successfully'
       - name: Publish ${{env.MINGW_PACKAGE_PREFIX}}-git
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: pkg-${{env.ARCHITECTURE}}
           path: artifacts
@@ -363,14 +374,14 @@ jobs:
     steps:
       - name: clone git-for-windows-automation
         if: needs.pkg.outputs.check-run-state != '' && always()
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Download pkg-${{env.ARCHITECTURE}}
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: pkg-${{env.ARCHITECTURE}}
           path: pkg-${{env.ARCHITECTURE}}
       - name: Download bundle-artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: bundle-artifacts
           path: bundle-artifacts
@@ -453,7 +464,7 @@ jobs:
         run: |
           cp /usr/src/build-extra/mingit/root/etc/package-versions.txt artifacts/
       - name: Publish ${{matrix.artifact.name}}-${{env.ARCHITECTURE}}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{matrix.artifact.name}}-${{env.ARCHITECTURE}}
           path: artifacts
@@ -482,7 +493,7 @@ jobs:
     needs: ['pkg', 'artifacts']
     steps:
       - name: gather all SHA-256 checksums
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         env:
           SHA256SUMS: ${{ toJSON(needs.artifacts.outputs) }}
         with:
@@ -491,13 +502,13 @@ jobs:
             fs.mkdirSync('sha256sums')
             fs.writeFileSync('sha256sums/sha256sums.txt', Object.values(JSON.parse(process.env.SHA256SUMS)).join('\n'))
       - name: publish SHA-256 checksums
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: sha256sums
           path: sha256sums
       - name: clone git-for-windows-automation
         if: needs.pkg.outputs.check-run-state != '' && always()
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: restore check-run state
         if: needs.pkg.outputs.check-run-state != '' && always()
         id: check-run-state

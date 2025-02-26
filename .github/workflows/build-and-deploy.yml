@@ -36,9 +36,10 @@ env:
 
 jobs:
   build:
+    if: github.event.repository.owner.login == 'git-for-windows'
     runs-on: ${{ github.event.inputs.architecture == 'aarch64' && fromJSON('["Windows", "ARM64"]') || 'windows-latest' }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
         # Since we want to operate on _another_ repository, we sadly cannot use:
         #
@@ -64,7 +65,7 @@ jobs:
 
       - name: Identify actor
         id: actor
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             const githubApiRequest = require('./github-api-request')
@@ -98,10 +99,35 @@ jobs:
 
       - name: Download Git for Windows SDK
         uses: git-for-windows/setup-git-for-windows-sdk@v1
+        id: setup-sdk
         with:
           flavor: ${{ env.PACKAGE_TO_BUILD == 'mingw-w64-git' && 'build-installers' || 'full' }}
           architecture: ${{ env.ARCHITECTURE || 'x86_64' }}
           msys: ${{ env.REPO == 'MSYS2-packages' || env.PACKAGE_TO_BUILD == 'git-for-windows-keyring' }}
+
+      - name: work around curl v8.11.0-1 problem
+        if: env.PACKAGE_TO_BUILD == 'curl' && env. REF == 'd58b04ae4163fe6c6c25b330bea0930d7bb627ac'
+        shell: bash
+        run: |
+          # `git fetch` does not work with that libcurl version. For details,
+          # see https://github.com/git-for-windows/MSYS2-packages/pull/199
+          test ! -f /var/lib/pacman/local/libcurl-8.11.0-1/desc ||
+          for pkg in libcurl curl
+          do
+            case "$ARCHITECTURE" in
+            i686) url=https://wingit.blob.core.windows.net/i686/$pkg-8.10.1-1-i686.pkg.tar.xz;;
+            x86_64) url=https://wingit.blob.core.windows.net/x86-64/$pkg-8.10.1-1-x86_64.pkg.tar.xz;;
+            esac
+            for suffix in '' .sig
+            do
+              curl --retry 5 -fLO $url$suffix || exit 1
+            done
+            pacman -U --noconfirm ${url##*/} || exit 1
+          done
+
+          # Sadly, this does not work because the Pacman repository's index only
+          # ever lists the latest package version:
+          # pacman -S --noconfirm libcurl=8.10.1-1 curl=8.10.1-1
 
       - name: Clone ${{ env.REPO }}
         shell: bash
@@ -122,9 +148,11 @@ jobs:
         shell: bash
         run: git clone --depth 1 --single-branch -b main https://github.com/git-for-windows/build-extra /usr/src/build-extra
 
-      - name: pacman -Syyu
-        shell: bash
-        run: pacman -Syyu --noconfirm
+      - name: update the SDK ("pacman -Syyu")
+        timeout-minutes: 20
+        shell: powershell
+        run: |
+          & ("${{ steps.setup-sdk.outputs.result }}\update-via-pacman.ps1")
 
       - name: rebase `.dll` base addresses
         if: env.ARCHITECTURE == 'i686'
@@ -160,6 +188,7 @@ jobs:
           bash -lc "set -x && rebase -v -i /usr/lib/perl5/core_perl/auto/Cwd/Cwd.dll"
 
       - name: Get GPG key(s)
+        timeout-minutes: 5
         shell: bash
         env:
           CARCH: x86_64 # dummy, to allow sourcing cv2pdb's PKGBUILD as-is
@@ -201,6 +230,7 @@ jobs:
           echo "SIGNTOOL=git signtool" >>$GITHUB_ENV
 
       - name: Build ${{env.PACKAGE_TO_BUILD}}
+        timeout-minutes: ${{ env.PACKAGE_TO_BUILD== 'mingw-w64-llvm' && 360 || 150 }}
         env:
           GPGKEY: ${{secrets.GPGKEY}}
           MAKEPKG: ${{ env.REPO != 'MSYS2-packages' && env.PACKAGE_TO_BUILD != 'git-for-windows-keyring' && 'makepkg-mingw' || 'makepkg' }}
@@ -271,33 +301,36 @@ jobs:
           append-text: 'The build was successful!'
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         with:
           name: artifacts
           path: artifacts
 
-      - name: Prepare home directory for deploying to the Pacman repository
-        if: env.BUILD_ONLY != 'true' && env.AZURE_BLOBS_TOKEN != ''
-        env:
-          AZURE_BLOBS_TOKEN: ${{secrets.AZURE_BLOBS_TOKEN}}
-        shell: bash
-        run: |
-          echo "::add-mask::$(echo "$AZURE_BLOBS_TOKEN" | base64 -w 0)" &&
-          echo "$AZURE_BLOBS_TOKEN" >"$HOME"/.azure-blobs-token
+      - uses: actions/create-github-app-token@v1
+        id: pacman-repo-token
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: pacman-repo
 
       - name: ${{ env.BUILD_ONLY == 'true' && 'Test-deploy' || 'Deploy' }} Pacman packages
-        if: env.BUILD_ONLY == 'true' || env.AZURE_BLOBS_TOKEN != ''
+        if: env.BUILD_ONLY == 'true' || env.azure_blobs_token != ''
         shell: bash
         env:
           GPGKEY: ${{secrets.GPGKEY}}
           PACMANDRYRUN: ${{env.BUILD_ONLY}}
-          AZURE_BLOBS_TOKEN: ${{secrets.AZURE_BLOBS_TOKEN}}
+          azure_blobs_token: ${{secrets.AZURE_BLOBS_TOKEN}}
+          GITHUB_TOKEN: ${{ steps.pacman-repo-token.outputs.token }}
         run: /usr/src/build-extra/pacman-helper.sh quick_add artifacts/*
 
       - name: Clean up temporary files
         if: always()
         shell: bash
-        run: rm -rf "$HOME"
+        run: |
+          gpgconf --kill dirmngr &&
+          gpgconf --kill gpg-agent &&
+          { rm -rf "$HOME" || echo "Gracefully leaving files undeleted" >&2; }
 
       - name: mark check run as completed
         if: env.CREATE_CHECK_RUN != 'false' && always()

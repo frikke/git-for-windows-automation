@@ -33,6 +33,9 @@ inputs:
   git_artifacts_x86_64_workflow_run_id:
     description: 'ID of the git-artifacts (x86_64) workflow run'
     required: true
+  git_artifacts_aarch64_workflow_run_id:
+    description: 'ID of the git-artifacts (aarch64) workflow run'
+    required: true
   gpg-key:
     description: 'The GPG key to use to sign the updated Pacman database'
     required: true
@@ -45,7 +48,7 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         ref: release
     - name: Mirror Check Run to ${{ inputs.owner }}/${{ inputs.repo }}
@@ -58,11 +61,11 @@ runs:
         rev: ${{ inputs.rev }}
         check-run-name: "pacman-packages"
         title: "Deploy the mingw-w64-git packages ${{ inputs.display-version }}"
-        summary: "Downloading the Pacman packages from ${{ inputs.git_artifacts_x86_64_workflow_run_id }} and ${{ inputs.git_artifacts_i686_workflow_run_id }} and deploying them to the Pacman Repository"
+        summary: "Downloading the Pacman packages from ${{ inputs.git_artifacts_x86_64_workflow_run_id }}, ${{ inputs.git_artifacts_i686_workflow_run_id }}, and ${{ inputs.git_artifacts_aarch64_workflow_run_id }} and deploying them to the Pacman Repository"
         text: "For details, see [this run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id}})."
         details-url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id}}"
     - name: Download artifacts
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       with:
         script: |
           const [ artifactsOwner, artifactsRepo ] = '${{ inputs.artifacts-repository }}'.split('/')
@@ -84,6 +87,15 @@ runs:
             ${{ inputs.git_artifacts_i686_workflow_run_id }},
             'pkg-i686'
           )
+
+          await getWorkflowRunArtifact(
+            console,
+            ${{ toJSON(inputs.artifacts-token) }},
+            artifactsOwner,
+            artifactsRepo,
+            ${{ inputs.git_artifacts_aarch64_workflow_run_id }},
+            'pkg-aarch64'
+          )
     - name: Download Git for Windows SDK
       uses: git-for-windows/setup-git-for-windows-sdk@v1
       with:
@@ -102,18 +114,30 @@ runs:
       shell: bash
       env:
         GPG_OPTIONS: "--batch --yes --no-tty --list-options no-show-photos --verify-options no-show-photos --pinentry-mode loopback"
+        GPGKEY: ${{ inputs.gpg-key }}
       run: |
         mkdir -p "$HOME" &&
         echo '${{ inputs.priv-gpg-key }}' | tr % '\n' | gpg $GPG_OPTIONS --import &&
-        git config --global gpg.program "$RUNNER_TEMP/build-extra/gnupg-with-gpgkey.sh"
+        git config --global gpg.program "$RUNNER_TEMP/build-extra/gnupg-with-gpgkey.sh" &&
+        info="$(gpg --list-keys --with-colons "${GPGKEY%% *}" | cut -d : -f 1,10 | sed -n '/^uid/{s|uid:||p;q}')" &&
+        git config --global user.name "${info% <*}" &&
+        git config --global user.email "<${info#*<}"
+    - uses: actions/create-github-app-token@v1
+      id: pacman-repo-token
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ inputs.owner }}
+        repositories: pacman-repo
     - name: Upload Pacman packages
       shell: bash
       env:
         GPG_OPTIONS: "--batch --yes --no-tty --list-options no-show-photos --verify-options no-show-photos --pinentry-mode loopback"
         GPGKEY: ${{ inputs.gpg-key }}
         azure_blobs_token: ${{ inputs.azure-blobs-token }}
+        GITHUB_TOKEN: ${{ steps.pacman-repo-token.outputs.token }}
       run: |
-        "$RUNNER_TEMP"/build-extra/pacman-helper.sh quick_add pkg-x86_64/*.tar.* pkg-i686/*.tar.*
+        "$RUNNER_TEMP"/build-extra/pacman-helper.sh quick_add pkg-x86_64/*.tar.* pkg-i686/*.tar.* pkg-aarch64/*.tar.*
     - name: update check-run
       if: always()
       uses: ./.github/actions/check-run-action

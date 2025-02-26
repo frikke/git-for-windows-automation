@@ -1,3 +1,5 @@
+#Requires -RunAsAdministrator
+
 param (
     # https://docs.github.com/en/actions/hosting-your-own-runners/adding-self-hosted-runners
     [Parameter(Mandatory = $true, HelpMessage = "GitHub Actions Runner registration token. Note that these tokens are only valid for one hour after creation, so we always expect the user to provide one.")]
@@ -12,6 +14,10 @@ param (
     [Parameter(Mandatory = $true, HelpMessage = "Name of the runner. Needs to be unique in the org/repo")]
     [ValidateNotNullOrEmpty()]
     [string]$GithubActionsRunnerName,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Start an ephemeral runner (this is the default)")]
+    [ValidateSet('true', 'false')]
+    [string]$Ephemeral = 'true',
 
     [Parameter(Mandatory = $false, HelpMessage = "Stop Service immediately (useful for spinning up runners preemptively)")]
     [ValidateSet('true', 'false')]
@@ -45,12 +51,13 @@ Write-Output "Starting post-deployment script."
 [string]$GitHubUrl = "https://api.github.com/repos/git-for-windows/git/releases/latest"
 #
 # Name of the exe file that should be verified and downloaded
-[string]$GithubExeName = "Git-.*-64-bit.exe"
+[string]$GithubExeName = "Git-.*-arm64.exe"
 
 try {
     [System.Object]$GithubRestData = Invoke-RestMethod -Uri $GitHubUrl -Method Get -Headers $GithubHeaders -TimeoutSec 10 | Select-Object -Property assets, body
     [System.Object]$GitHubAsset = $GithubRestData.assets | Where-Object { $_.name -match $GithubExeName }
-    if ($GithubRestData.body -match "\b${[Regex]::Escape($GitHubAsset.name)}.*?\|.*?([a-zA-Z0-9]{64})" -eq $True) {
+    $AssetNameEscaped = [Regex]::Escape($GitHubAsset.name)
+    if ($GithubRestData.body -match "\b${AssetNameEscaped}.*?\|.*?([a-zA-Z0-9]{64})" -eq $True) {
         [System.Object]$GitHubGit = [PSCustomObject]@{
             DownloadUrl = [string]$GitHubAsset.browser_download_url
             Hash        = [string]$Matches[1].ToUpper()
@@ -99,6 +106,43 @@ try {
     }
     else {
         Write-Error "Error: Could not find hash for Github Actions Runner"
+        exit 1
+    }
+}
+catch {
+    Write-Error @"
+   "Message: "$($_.Exception.Message)`n
+   "Error Line: "$($_.InvocationInfo.Line)`n
+   "Line Number: "$($_.InvocationInfo.ScriptLineNumber)`n
+"@
+    exit 1
+}
+
+# =================================
+# Obtain the latest pwsh binary and other pwsh information
+# =================================
+#
+# This will install pwsh on the machine, because it's not installed by default.
+# It contains a bunch of new features compared to "powershell" and is sometimes more stable as well.
+#
+# url for Github API to get the latest release of pwsh
+[string]$PwshUrl = "https://api.github.com/repos/PowerShell/PowerShell/releases/latest"
+
+# Name of the MSI file that should be verified and downloaded
+[string]$PwshMsiName = "PowerShell-.*-win-arm64.msi"
+
+try {
+    [System.Object]$PwshRestData = Invoke-RestMethod -Uri $PwshUrl -Method Get -Headers $GithubHeaders -TimeoutSec 10 | Select-Object -Property assets, body
+    [System.Object]$PwshAsset = $PwshRestData.assets | Where-Object { $_.name -match $PwshMsiName }
+    if ($PwshRestData.body -match "\b$([Regex]::Escape($PwshAsset.name))\r\n.*?([a-zA-Z0-9]{64})" -eq $True) {
+        [System.Object]$GitHubPwsh = [PSCustomObject]@{
+            DownloadUrl = [string]$PwshAsset.browser_download_url
+            Hash        = [string]$Matches[1].ToUpper()
+            OutFile     = "./pwsh-installer.msi"
+        }
+    }
+    else {
+        Write-Error "Could not find hash for $PwshMsiName"
         exit 1
     }
 }
@@ -174,6 +218,34 @@ Start-Process -Wait $GitHubGit.OutFile '/VERYSILENT /NORESTART /NOCANCEL /SP- /C
 Write-Output "Finished installing Git for Windows."
 
 # ======================
+# PWSH (PowerShell)
+# ======================
+
+Write-Output "Downloading pwsh..."
+
+$ProgressPreference = 'SilentlyContinue'
+Invoke-WebRequest -UseBasicParsing -Uri $GitHubPwsh.DownloadUrl -OutFile $GitHubPwsh.OutFile
+$ProgressPreference = 'Continue'
+
+if ((Get-FileHash -Path $GitHubPwsh.OutFile -Algorithm SHA256).Hash.ToUpper() -ne $GitHubPwsh.Hash) {
+    Write-Error "Computed checksum for $($GitHubPwsh.OutFile) did not match $($GitHubPwsh.Hash)"
+    exit 1
+}
+
+Write-Output "Installing pwsh..."
+
+# Get the full path to the MSI in the current working directory
+$MsiPath = Resolve-Path $GitHubPwsh.OutFile
+
+# Define arguments for silent installation
+$MsiArguments = "/qn /i  `"$MsiPath`" ADD_PATH=1"
+
+# Install pwsh using msiexec
+Start-Process msiexec.exe -Wait -ArgumentList $MsiArguments
+
+Write-Output "Finished installing pwsh."
+
+# ======================
 # GITHUB ACTIONS RUNNER
 # ======================
 
@@ -193,12 +265,17 @@ Write-Output "Installing GitHub Actions runner $($GitHubAction.Tag) as a Windows
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem ; [System.IO.Compression.ZipFile]::ExtractToDirectory($GitHubAction.OutFile, $GitHubActionsRunnerPath)
 
-Write-Output "Configuring the runner to shut down automatically after running"
-Set-Content -Path "${GitHubActionsRunnerPath}\shut-down.ps1" -Value "shutdown -s -t 60 -d p:4:0 -c `"workflow job is done`""
-[System.Environment]::SetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_COMPLETED", "${GitHubActionsRunnerPath}\shut-down.ps1", [System.EnvironmentVariableTarget]::Machine)
+If ($Ephemeral -ne 'true') {
+    $EphemeralOption = ""
+} Else {
+    $EphemeralOption = "--ephemeral"
+    Write-Output "Configuring the runner to shut down automatically after running"
+    Set-Content -Path "${GitHubActionsRunnerPath}\shut-down.ps1" -Value "shutdown -s -t 60 -d p:4:0 -c `"workflow job is done`""
+    [System.Environment]::SetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_COMPLETED", "${GitHubActionsRunnerPath}\shut-down.ps1", [System.EnvironmentVariableTarget]::Machine)
+}
 
 Write-Output "Configuring the runner"
-cmd.exe /c "${GitHubActionsRunnerPath}\config.cmd" --unattended --ephemeral --name ${GithubActionsRunnerName} --runasservice --labels $($GitHubAction.RunnerLabels) --url ${GithubActionsRunnerRegistrationUrl} --token ${GitHubActionsRunnerToken}
+cmd.exe /c "${GitHubActionsRunnerPath}\config.cmd" --unattended $EphemeralOption --name ${GithubActionsRunnerName} --windowslogonaccount "NT AUTHORITY\SYSTEM" --runasservice --labels $($GitHubAction.RunnerLabels) --url ${GithubActionsRunnerRegistrationUrl} --token ${GitHubActionsRunnerToken}
 
 # Ensure that the service was created. If not, exit with error code.
 if ($null -eq (Get-Service -Name "actions.runner.*")) {

@@ -9,6 +9,7 @@ const createRelease = async (context, token, owner, repo, tagName, rev, name, bo
       target_commitish: rev,
       name,
       body,
+      discussion_category_name: 'Announcements',
       draft: draft === undefined ? true : draft,
       prerelease: prerelease === undefined ? true : prerelease
     }
@@ -57,22 +58,39 @@ const getWorkflowRunArtifactsURLs = async (context, token, owner, repo, workflow
   }, {})
 }
 
-const downloadAndUnZip = async (token, url, name) => {
+const download = async (token, url, outputFile) => {
   const { spawnSync } = require('child_process')
-  const auth = token ? ['-H', `Authorization: Bearer ${token}`] : []
-  const tmpFile = `${process.env.RUNNER_TEMP || process.env.TEMP || '/tmp'}/${name}.zip`
-  const curl = spawnSync('curl', [...auth, '-Lo', tmpFile, url])
+  const headers = token ? ['-H', `Authorization: Bearer ${token}`] : []
+  if (url.match(/^https:\/\/github.com\/[^/]+\/[^/]+\/releases\/assets\/\d+$/)
+    || url.match(/^https:\/\/api\.github.com\/repos\/[^/]+\/[^/]+\/releases\/assets\/\d+$/)) {
+    headers.push('-H', 'Accept: application/octet-stream')
+  }
+  const curl = spawnSync('curl', [...headers, '-fLo', outputFile, url])
   if (curl.error) throw curl.error
-  const { mkdirSync, rmSync } = require('fs')
-  await mkdirSync(name, { recursive: true })
-  const unzip = spawnSync('unzip', ['-d', name, tmpFile])
+}
+
+const unzip = async (zipFile, outputDirectory) => {
+  const { mkdirSync } = require('fs')
+  await mkdirSync(outputDirectory, { recursive: true })
+  const { spawnSync } = require('child_process')
+  const unzip = spawnSync('unzip', ['-d', outputDirectory, zipFile])
   if (unzip.error) throw unzip.error
+}
+
+const getTempFile = (name) => `${process.env.RUNNER_TEMP || process.env.TEMP || '/tmp'}/${name}`
+
+const downloadAndUnZip = async (token, url, name) => {
+  const tmpFile = getTempFile(`${name}.zip`)
+  await download(token, url, tmpFile)
+  await unzip(tmpFile, name)
+  const { rmSync } = require('fs')
   rmSync(tmpFile)
 }
 
 const architectures = [
   { name: 'x86_64', infix: '-64-bit' },
-  { name: 'i686', infix: '-32-bit' }
+  { name: 'i686', infix: '-32-bit' },
+  { name: 'aarch64', infix: '-arm64' }
 ]
 
 const artifacts = [
@@ -90,16 +108,25 @@ const ranked = artifacts
 const artifactName2Rank = (name) => {
   let rank = ranked.indexOf(name
     .replace(/-\d+(\.\d+)*(-rc\d+)?/, '')
-    .replace(/-(32|64)-bit/, '')
-  ) + (name.indexOf('-64-bit') > 0 ? 0.5 : 0)
+    .replace(/-((32|64)-bit|arm64)/, '')
+  ) + (name.indexOf('-64-bit') > 0 ? 0.5 : (name.indexOf('-arm64') > 0 ? 0.3 : 0))
   return rank
 }
 
-const downloadBundleArtifacts = async (context, token, owner, repo, git_artifacts_i686_workflow_run_id, git_artifacts_x86_64_workflow_run_id) => {
+const downloadBundleArtifacts = async (
+  context,
+  token,
+  owner,
+  repo,
+  git_artifacts_i686_workflow_run_id,
+  git_artifacts_x86_64_workflow_run_id,
+  git_artifacts_aarch64_workflow_run_id
+) => {
   for (const architecture of architectures) {
     const workflowRunId = {
       x86_64: git_artifacts_x86_64_workflow_run_id,
-      i686: git_artifacts_i686_workflow_run_id
+      i686: git_artifacts_i686_workflow_run_id,
+      aarch64: git_artifacts_aarch64_workflow_run_id
     }[architecture.name]
     const downloadURLs = await getWorkflowRunArtifactsURLs(context, token, owner, repo, workflowRunId)
     if (architecture.name === 'x86_64') await downloadAndUnZip(token, downloadURLs['bundle-artifacts'], 'bundle-artifacts')
@@ -134,6 +161,18 @@ const downloadBundleArtifacts = async (context, token, owner, repo, git_artifact
 
   fs.writeFileSync('bundle-artifacts/sha256sums', checksums)
 
+  // Work around out-of-band versions' announcement file containing parentheses
+  const withParens = result.ver.replace(/^(\d+\.\d+\.\d+)\.(\d+)$/, '$1($2)')
+  console.log(`withParens: ${withParens}`)
+  if (result.ver !== withParens) {
+    if (!fs.existsSync(`bundle-artifacts/announce-${result.ver}`)) {
+      fs.renameSync(`bundle-artifacts/announce-${withParens}`, `bundle-artifacts/announce-${result.ver}`)
+    }
+    if (!fs.existsSync(`bundle-artifacts/release-notes-${result.ver}`)) {
+      fs.renameSync(`bundle-artifacts/release-notes-${withParens}`, `bundle-artifacts/release-notes-${result.ver}`)
+    }
+  }
+
   result.announcement = fs
     .readFileSync(`bundle-artifacts/announce-${result.ver}`)
     .toString()
@@ -149,17 +188,28 @@ const downloadBundleArtifacts = async (context, token, owner, repo, git_artifact
   return result
 }
 
-const getGitArtifacts = async (context, token, owner, repo, git_artifacts_i686_workflow_run_id, git_artifacts_x86_64_workflow_run_id) => {
+const getGitArtifacts = async (
+  context,
+  token,
+  owner,
+  repo,
+  git_artifacts_i686_workflow_run_id,
+  git_artifacts_x86_64_workflow_run_id,
+  git_artifacts_aarch64_workflow_run_id
+) => {
   const fs = require('fs')
   const result = []
   for (const architecture of architectures) {
     const workflowRunId = {
       x86_64: git_artifacts_x86_64_workflow_run_id,
-      i686: git_artifacts_i686_workflow_run_id
+      i686: git_artifacts_i686_workflow_run_id,
+      aarch64: git_artifacts_aarch64_workflow_run_id
     }[architecture.name]
 
     const urls = await getWorkflowRunArtifactsURLs(context, token, owner, repo, workflowRunId)
     for (const artifact of artifacts) {
+      if (architecture.name === 'aarch64' && artifact.name === 'mingit-busybox') continue
+      if (architecture.name === 'i686' && !artifact.name.startsWith('mingit')) continue
       const name = `${artifact.name}-${architecture.name}`
       context.log(`Downloading ${name}`)
       await downloadAndUnZip(token, urls[name], name)
@@ -254,11 +304,42 @@ const pushGitTag = (context, setSecret, token, owner, repo, tagName, bundlePath)
   context.log('Done pushing tag')
 }
 
+const downloadReleaseAssets = async (context, setSecret, appId, privateKey, owner, repo, tagName, filenameMatcher) => {
+  const { getAccessTokenForRepo } = require('./repository-updates.js')
+  const token = await getAccessTokenForRepo(context, setSecret, appId, privateKey, owner, repo)
+
+  const githubApiRequest = require('./github-api-request.js')
+  const release = await githubApiRequest(
+    context,
+    token,
+    'GET',
+    `https://api.github.com/repos/${owner}/${repo}/releases/tags/${tagName}`
+  )
+
+  for (const asset of release.assets) {
+    if (!filenameMatcher || filenameMatcher(asset.name)) {
+      context.log(`Downloading ${asset.name}`)
+      await download(token, asset.url, asset.name)
+    }
+  }
+}
+
+const downloadReleaseAssetsFromURL = async (context, setSecret, appId, privateKey, releaseURL, filenameMatcher) => {
+  const [, owner, repo, tagName] = releaseURL.match(
+    /^https:\/\/github.com\/([^/]+)\/([^/]+)\/releases\/tag\/([^/]+)$/
+  )
+  if (!owner || !repo || !tagName) throw new Error(`Invalid release URL: ${releaseURL}`)
+    return await downloadReleaseAssets(context, setSecret, appId, privateKey, owner, repo, tagName, filenameMatcher)
+}
+
 module.exports = {
   createRelease,
   updateRelease,
   uploadReleaseAsset,
   getWorkflowRunArtifactsURLs,
+  download,
+  unzip,
+  getTempFile,
   downloadAndUnZip,
   downloadBundleArtifacts,
   getGitArtifacts,
@@ -266,5 +347,8 @@ module.exports = {
   calculateSHA256ForFile,
   checkSHA256Sums,
   uploadGitArtifacts,
-  pushGitTag
+  pushGitTag,
+  downloadReleaseAssets,
+  downloadReleaseAssetsFromURL,
+  architectures,
 }

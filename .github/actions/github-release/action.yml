@@ -39,6 +39,9 @@ inputs:
   git_artifacts_x86_64_workflow_run_id:
     description: 'ID of the git-artifacts (x86_64) workflow run'
     required: true
+  git_artifacts_aarch64_workflow_run_id:
+    description: 'ID of the git-artifacts (aarch64) workflow run'
+    required: true
 outputs:
   github-release-url:
     description: "The GitHub Release URL"
@@ -46,7 +49,7 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         ref: release
     - name: Mirror Check Run to ${{ inputs.owner }}/${{ inputs.repo }}
@@ -59,16 +62,16 @@ runs:
         rev: ${{ inputs.rev }}
         check-run-name: "github-release"
         title: "Publish ${{ inputs.display-version }} for @${{ inputs.rev }}"
-        summary: "Downloading the Git artifacts from ${{ inputs.git_artifacts_x86_64_workflow_run_id }} and ${{ inputs.git_artifacts_i686_workflow_run_id }} and publishing them as a new GitHub Release at ${{ inputs.owner }}/${{ inputs.repo }}"
+        summary: "Downloading the Git artifacts from ${{ inputs.git_artifacts_x86_64_workflow_run_id }}, ${{ inputs.git_artifacts_i686_workflow_run_id }} and ${{ inputs.git_artifacts_aarch64_workflow_run_id }} and publishing them as a new GitHub Release at ${{ inputs.owner }}/${{ inputs.repo }}"
         text: "For details, see [this run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id}})."
         details-url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id}}"
     - name: Download bundle-artifacts (needed to push the tag)
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: bundle-artifacts
         path: bundle-artifacts
     - name: create release and upload release assets
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       with:
         script: |
           const {
@@ -81,19 +84,6 @@ runs:
             updateRelease
           } = require('./github-release')
 
-          const [ artifactsOwner, artifactsRepo ] = '${{ inputs.artifacts-repository }}'.split('/')
-          const artifacts = await getGitArtifacts(
-            console,
-            ${{ toJSON(inputs.artifacts-token) }},
-            artifactsOwner,
-            artifactsRepo,
-            ${{ inputs.git_artifacts_i686_workflow_run_id }},
-            ${{ inputs.git_artifacts_x86_64_workflow_run_id }}
-          )
-
-          const sha256sums = sha256sumsFromReleaseNotes(${{ toJSON(inputs.release-notes) }})
-          await checkSHA256Sums(console, artifacts, sha256sums)
-
           const { initCheckRunState } = require('./check-runs')
           const state = await initCheckRunState(
             console,
@@ -102,8 +92,22 @@ runs:
             ${{ toJSON(inputs.private-key) }},
             '${{ inputs.owner }}',
             '${{ inputs.repo }}')
-          await state.refreshToken()
 
+          const [ artifactsOwner, artifactsRepo ] = '${{ inputs.artifacts-repository }}'.split('/')
+          const artifacts = await getGitArtifacts(
+            console,
+            ${{ toJSON(inputs.artifacts-token) }},
+            artifactsOwner,
+            artifactsRepo,
+            ${{ inputs.git_artifacts_i686_workflow_run_id }},
+            ${{ inputs.git_artifacts_x86_64_workflow_run_id }},
+            ${{ inputs.git_artifacts_aarch64_workflow_run_id }}
+          )
+
+          const sha256sums = sha256sumsFromReleaseNotes(${{ toJSON(inputs.release-notes) }})
+          await checkSHA256Sums(console, artifacts, sha256sums)
+
+          await state.refreshToken()
           const release = await createRelease(
             console,
             state.accessToken,
@@ -138,6 +142,7 @@ runs:
           await state.refreshToken()
 
           console.log('Publishing release')
+          const isPrerelease = '${{ inputs.tag-name }}'.indexOf('-rc') > 0
           await updateRelease(
             console,
             state.accessToken,
@@ -145,9 +150,27 @@ runs:
             '${{ inputs.repo }}',
             release.id, {
               draft: false,
-              prerelease: '${{ inputs.tag-name }}'.indexOf('-rc') > 0
+              prerelease: isPrerelease,
+              make_latest : !isPrerelease,
             }
           )
+
+          try {
+            await state.refreshToken()
+            console.log('Opening announcement (in Discussions)')
+            await updateRelease(
+              console,
+              state.accessToken,
+              '${{ inputs.owner }}',
+              '${{ inputs.repo }}',
+              release.id, {
+                discussion_category_name: 'Announcements',
+              }
+            )
+          } catch(e) {
+            console.log(`::warning::could not create Discussion`)
+            console.log(e)
+          }
     - name: update check-run
       if: always()
       uses: ./.github/actions/check-run-action
